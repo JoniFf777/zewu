@@ -1,0 +1,698 @@
+"""Native V3 write handoff helpers for confirmation-based actions."""
+
+from __future__ import annotations
+
+import re
+from contextlib import contextmanager
+from typing import Any, TypedDict
+
+from app.repositories import candidate_contexts as candidate_context_repository
+from app.repositories import products as product_repository
+from app.runtime import (
+    ACTION_REGISTRY,
+    ActionRequest,
+    ActionRegistryError,
+    ActionRiskClass,
+    EventVisibility,
+    ToolGateway,
+)
+from app.schemas.pending_actions import CartActionOutcome
+from agents.shopmind_multi_agent.permissions import AGENT_TOOL_ALLOWLIST
+from tools.cart import (
+    format_cart_action_outcome,
+    format_preference_action_outcome,
+    prepare_add_to_cart,
+    prepare_save_preference,
+)
+
+from .observability import (
+    append_candidate_context_event,
+    build_candidate_context_debug,
+)
+
+
+WRITE_HANDOFF_TOOL_CALL = "prepare_add_to_cart"
+PREFERENCE_WRITE_HANDOFF_TOOL_CALL = "prepare_save_preference"
+WRITE_HANDOFF_GATEWAY = ToolGateway.from_allowlist(
+    {"write_handoff": AGENT_TOOL_ALLOWLIST["write_handoff"]},
+    require_explicit_capabilities=True,
+)
+DEFAULT_CANDIDATE_CONTEXT_TTL_SECONDS = 600
+MAX_CANDIDATE_CONTEXTS = 100
+PRODUCT_ID_PATTERN = re.compile(r"\bTECH-[A-Z]{3}-\d{3}\b", re.IGNORECASE)
+PENDING_ACTION_PATTERN = re.compile(r"pending_action_id[：:]\s*([0-9a-fA-F-]+)")
+ARABIC_QUANTITY_PATTERNS = (
+    re.compile(r"(?:数量|qty|quantity)\s*[：:]?\s*(\d+)", re.IGNORECASE),
+    re.compile(r"[xX]\s*(\d+)"),
+    re.compile(r"(\d+)\s*(?:个|件|台|把|pcs?|pieces?)", re.IGNORECASE),
+)
+CHINESE_QUANTITY_PATTERN = re.compile(r"([一二两三四五六七八九十])\s*(?:个|件|台|把)")
+CHINESE_DIGITS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+CANDIDATE_SELECTION_PATTERN = re.compile(
+    r"^\s*(?:选|选择|就选|就要|要|第)\s*([1-9])\s*(?:个|号|款|项)?\s*$"
+)
+BARE_SELECTION_PATTERN = re.compile(r"^\s*([1-9])\s*$")
+CANDIDATE_SELECTION_KEYWORDS = (
+    "选",
+    "选择",
+    "就选",
+    "就要",
+    "第一个",
+    "第二个",
+    "第三个",
+)
+CATEGORY_KEYWORDS = (
+    ("Keyboards", ("键盘", "keyboard", "keyboards")),
+    ("Monitors", ("显示器", "monitor", "monitors")),
+    ("Audio", ("耳机", "音频", "headphone", "headphones", "audio")),
+    ("Laptops", ("电脑", "笔记本", "laptop", "laptops", "macbook")),
+    ("Accessories", ("配件", "线缆", "支架", "扩展坞", "accessory", "accessories")),
+)
+QUERY_STOPWORDS = {
+    "add",
+    "cart",
+    "to",
+    "put",
+    "this",
+    "that",
+    "my",
+    "buy",
+    "purchase",
+    "quantity",
+    "qty",
+}
+
+
+class CandidateSelectionResult(TypedDict, total=False):
+    status: str
+    product_id: str
+    quantity: int
+    selection: int
+    candidate_count: int
+
+
+@contextmanager
+def _get_product_session():
+    from app.db.session import SessionLocal
+
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def extract_product_id(message: str) -> str | None:
+    """Extract the first explicit ShopMind product ID from a user message."""
+
+    match = PRODUCT_ID_PATTERN.search(message)
+    return match.group(0).upper() if match else None
+
+
+def extract_quantity(message: str) -> int:
+    """Extract a simple explicit quantity, defaulting to one item."""
+
+    for pattern in ARABIC_QUANTITY_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            quantity = int(match.group(1))
+            if quantity > 0:
+                return quantity
+
+    match = CHINESE_QUANTITY_PATTERN.search(message)
+    if match:
+        return CHINESE_DIGITS[match.group(1)]
+
+    return 1
+
+
+def _candidate_context_key(
+    user_id: str | None,
+    thread_id: str | None,
+) -> tuple[str, str] | None:
+    if not user_id or not thread_id:
+        return None
+    return (user_id, thread_id)
+
+
+def store_candidate_context(
+    *,
+    user_id: str | None,
+    thread_id: str | None,
+    candidates: list[dict[str, Any]],
+    quantity: int,
+) -> dict[str, Any]:
+    """Store a short-lived database-backed candidate list for same-thread selection."""
+
+    if _candidate_context_key(user_id, thread_id) is None:
+        return {
+            "event": "candidate_context_skipped",
+            "reason": "missing_scope",
+            "candidate_count": len(candidates),
+        }
+    if not candidates:
+        return {
+            "event": "candidate_context_skipped",
+            "reason": "no_candidates",
+            "candidate_count": 0,
+        }
+
+    with _get_product_session() as session:
+        try:
+            context = candidate_context_repository.save_candidate_context(
+                session,
+                user_id=user_id,
+                thread_id=thread_id,
+                product_ids=[str(product["product_id"]) for product in candidates],
+                quantity=quantity,
+                ttl_seconds=DEFAULT_CANDIDATE_CONTEXT_TTL_SECONDS,
+                max_contexts=MAX_CANDIDATE_CONTEXTS,
+            )
+            session.commit()
+            if context is None:
+                return {
+                    "event": "candidate_context_skipped",
+                    "reason": "invalid_context",
+                    "candidate_count": len(candidates),
+                }
+            return {
+                "event": "candidate_context_stored",
+                "candidate_count": len(context["product_ids"]),
+                "quantity": context["quantity"],
+                "ttl_seconds": DEFAULT_CANDIDATE_CONTEXT_TTL_SECONDS,
+                "max_contexts": MAX_CANDIDATE_CONTEXTS,
+            }
+        except Exception:
+            session.rollback()
+            raise
+
+
+def get_candidate_context(
+    user_id: str | None,
+    thread_id: str | None,
+) -> dict[str, Any] | None:
+    if _candidate_context_key(user_id, thread_id) is None:
+        return None
+
+    with _get_product_session() as session:
+        try:
+            context = candidate_context_repository.get_candidate_context(
+                session,
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+            session.commit()
+            return context
+        except Exception:
+            session.rollback()
+            raise
+
+
+def clear_candidate_context(user_id: str | None, thread_id: str | None) -> bool:
+    if _candidate_context_key(user_id, thread_id) is None:
+        return False
+
+    with _get_product_session() as session:
+        try:
+            cleared = candidate_context_repository.clear_candidate_context(
+                session,
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+            session.commit()
+            return cleared
+        except Exception:
+            session.rollback()
+            raise
+
+
+def extract_candidate_selection(message: str) -> int | None:
+    """Extract a 1-based candidate selection index from a short follow-up."""
+
+    match = CANDIDATE_SELECTION_PATTERN.fullmatch(message)
+    if match:
+        return int(match.group(1))
+
+    match = BARE_SELECTION_PATTERN.fullmatch(message)
+    if match:
+        return int(match.group(1))
+
+    for index, text in enumerate(("第一个", "第二个", "第三个"), 1):
+        if text in message:
+            return index
+    return None
+
+
+def is_candidate_selection_message(message: str) -> bool:
+    """Return True for short messages that likely choose a prior candidate."""
+
+    stripped = message.strip()
+    if extract_candidate_selection(stripped) is not None:
+        return True
+    return any(keyword == stripped for keyword in CANDIDATE_SELECTION_KEYWORDS)
+
+
+def resolve_candidate_selection(
+    message: str,
+    user_id: str | None,
+    thread_id: str | None,
+) -> CandidateSelectionResult | None:
+    selection = extract_candidate_selection(message)
+    if selection is None:
+        return None
+
+    context = get_candidate_context(user_id, thread_id)
+    if context is None:
+        return {
+            "status": "missing_context",
+            "selection": selection,
+        }
+
+    product_ids = context["product_ids"]
+    if selection < 1 or selection > len(product_ids):
+        return {
+            "status": "out_of_range",
+            "selection": selection,
+            "candidate_count": len(product_ids),
+        }
+
+    quantity = extract_quantity(message)
+    if quantity == 1:
+        quantity = context["quantity"]
+    return {
+        "status": "selected",
+        "product_id": product_ids[selection - 1],
+        "quantity": quantity,
+    }
+
+
+def infer_product_category(message: str) -> str | None:
+    """Infer a catalog category from common Chinese/English product words."""
+
+    lowered = message.lower()
+    for category, keywords in CATEGORY_KEYWORDS:
+        if any(keyword.lower() in lowered for keyword in keywords):
+            return category
+    return None
+
+
+def extract_product_query(message: str) -> str | None:
+    """Extract a conservative English product keyword for catalog lookup."""
+
+    tokens = [
+        token
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9+-]{2,}", message)
+        if token.lower() not in QUERY_STOPWORDS
+        and not PRODUCT_ID_PATTERN.fullmatch(token)
+    ]
+    return " ".join(tokens[:3]) if tokens else None
+
+
+def find_product_candidates(message: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Find read-only product candidates for ambiguous write handoff requests."""
+
+    category = infer_product_category(message)
+    query = None if category else extract_product_query(message)
+    if not category and not query:
+        return []
+
+    with _get_product_session() as session:
+        return product_repository.search_products(
+            session,
+            query=query,
+            category=category,
+            in_stock_only=True,
+            limit=limit,
+        )
+
+
+def _format_candidate_line(product: dict[str, Any], index: int) -> str:
+    return (
+        f"{index}. {product['name']}（{product['product_id']}）"
+        f" - ${product['price']:.2f}"
+    )
+
+
+def _format_product_id_clarification(candidates: list[dict[str, Any]]) -> str:
+    if not candidates:
+        return (
+            "我可以帮你创建待确认加购动作，但需要明确商品 ID，"
+            "例如 TECH-KEY-001。"
+        )
+
+    lines = [
+        _format_candidate_line(product, index)
+        for index, product in enumerate(candidates, 1)
+    ]
+    return (
+        "我还不能确定要加入购物车的具体商品。请回复要加购的商品 ID，"
+        "可从这些候选中选择：\n"
+        + "\n".join(lines)
+    )
+
+
+def _format_candidate_selection_out_of_range(
+    selection: int,
+    candidate_count: int,
+) -> str:
+    return (
+        f"当前候选只有 1-{candidate_count}，你选择的是 {selection}。"
+        "请重新选择候选编号，或直接回复明确的商品 ID，例如 TECH-KEY-001。"
+    )
+
+
+def extract_pending_action_id(tool_result: str) -> str | None:
+    """Extract a pending action ID from the prepare_add_to_cart tool output."""
+
+    match = PENDING_ACTION_PATTERN.search(tool_result)
+    return match.group(1) if match else None
+
+
+def parse_cart_action_outcome(tool_result: Any) -> CartActionOutcome | None:
+    """Decode the internal typed result without inspecting presentation text."""
+
+    if not isinstance(tool_result, str):
+        return None
+    try:
+        return CartActionOutcome.model_validate_json(tool_result)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_preference_write_intent(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        keyword in lowered
+        for keyword in (
+            "记住",
+            "不要推荐",
+            "以后别",
+            "保存偏好",
+            "save preference",
+            "remember that",
+            "do not recommend",
+            "don't recommend",
+            "never recommend",
+        )
+    )
+
+
+def extract_preference_type(message: str) -> str:
+    lowered = message.lower()
+    for preference_type, keywords in (
+        ("budget", ("预算", "budget")),
+        ("brand", ("品牌", "brand")),
+        ("avoid", ("不要推荐", "以后别", "避免", "do not", "don't", "never")),
+        ("usage", ("用途", "usage", "use case")),
+        ("style", ("风格", "喜欢", "style", "prefer")),
+    ):
+        if any(keyword in lowered for keyword in keywords):
+            return preference_type
+    return "other"
+
+
+def _invoke_preference_write_handoff(
+    message: str,
+    user_id: str | None,
+    thread_id: str | None,
+    runtime_context: Any | None,
+    tool_gateway: ToolGateway | None,
+) -> dict[str, Any]:
+    if not user_id:
+        return {
+            "answer": "需要先提供 user_id，才能为你创建待确认的偏好保存动作。",
+            "status": "completed",
+            "tool_calls": [],
+        }
+    preference_type = extract_preference_type(message)
+    preference_value = message.strip()
+    try:
+        ACTION_REGISTRY.validate_request(
+            ActionRequest(
+                action_type="save_preference",
+                user_id=user_id,
+                thread_id=thread_id,
+                arguments={
+                    "preference_type": preference_type,
+                    "preference_value": preference_value,
+                },
+                preview=f"保存偏好：{preference_value}",
+                risk_class=ActionRiskClass.MEDIUM,
+            )
+        )
+    except ActionRegistryError:
+        return {
+            "answer": "当前无法创建偏好保存动作，请稍后重试。",
+            "status": "failed",
+            "tool_calls": [],
+        }
+    gateway = tool_gateway or WRITE_HANDOFF_GATEWAY
+    tool_result, tool_record = gateway.invoke(
+        agent_name="write_handoff",
+        tool=prepare_save_preference,
+        arguments={
+            "user_id": user_id,
+            "preference_type": preference_type,
+            "preference_value": preference_value,
+            "thread_id": thread_id,
+        },
+        context=runtime_context,
+    )
+    outcome = parse_cart_action_outcome(tool_result)
+    pending_action_id = outcome.pending_action_id if outcome is not None else None
+    if pending_action_id and runtime_context is not None:
+        runtime_context.emit_event(
+            "action.prepared",
+            visibility=EventVisibility.CLIENT,
+            agent_name="write_handoff",
+            payload={
+                "action_id": pending_action_id,
+                "action_type": "save_preference",
+                "status": "pending",
+                "risk_class": "medium",
+            },
+        )
+    return {
+        "answer": (
+            format_preference_action_outcome(outcome)
+            if outcome is not None
+            else "无法解析保存偏好动作结果，请稍后重试。"
+        ),
+        "status": (
+            "confirmation_required"
+            if outcome is not None and outcome.status == "prepared" and pending_action_id
+            else "failed"
+        ),
+        "tool_calls": [PREFERENCE_WRITE_HANDOFF_TOOL_CALL],
+        "tool_call_records": [tool_record.model_dump(mode="json")],
+        "pending_action_id": pending_action_id,
+    }
+
+
+def invoke_write_handoff(
+    message: str,
+    user_id: str | None = None,
+    thread_id: str | None = None,
+    runtime_context: Any | None = None,
+    tool_gateway: ToolGateway | None = None,
+) -> dict[str, Any]:
+    """Prepare a confirmation-required write action for explicit V3 requests."""
+
+    if is_preference_write_intent(message):
+        return _invoke_preference_write_handoff(
+            message,
+            user_id,
+            thread_id,
+            runtime_context,
+            tool_gateway,
+        )
+
+    candidate_context_events: list[dict[str, Any]] = []
+
+    if not user_id:
+        return {
+            "answer": "需要先提供 user_id，才能为你创建待确认的加购动作。",
+            "status": "completed",
+            "tool_calls": [],
+        }
+
+    product_id = extract_product_id(message)
+    quantity = extract_quantity(message)
+    selected_candidate = (
+        None
+        if product_id is not None
+        else resolve_candidate_selection(message, user_id, thread_id)
+    )
+    resolved_from_candidate = False
+    if selected_candidate is not None:
+        if selected_candidate["status"] == "missing_context":
+            candidate_context_events = append_candidate_context_event(
+                candidate_context_events,
+                event="candidate_context_missed",
+                selection=int(selected_candidate["selection"]),
+            )
+        if selected_candidate["status"] == "out_of_range":
+            candidate_context_events = append_candidate_context_event(
+                candidate_context_events,
+                event="candidate_context_out_of_range",
+                selection=int(selected_candidate["selection"]),
+                candidate_count=int(selected_candidate["candidate_count"]),
+            )
+            return {
+                "answer": _format_candidate_selection_out_of_range(
+                    int(selected_candidate["selection"]),
+                    int(selected_candidate["candidate_count"]),
+                ),
+                "status": "completed",
+                "tool_calls": [],
+                "debug": build_candidate_context_debug(candidate_context_events),
+            }
+        if selected_candidate["status"] == "selected":
+            product_id = selected_candidate["product_id"]
+            quantity = int(selected_candidate["quantity"])
+            resolved_from_candidate = True
+            candidate_context_events = append_candidate_context_event(
+                candidate_context_events,
+                event="candidate_context_selected",
+                quantity=quantity,
+            )
+
+    if product_id is None:
+        candidates = find_product_candidates(message)
+        store_event = store_candidate_context(
+            user_id=user_id,
+            thread_id=thread_id,
+            candidates=candidates,
+            quantity=quantity,
+        )
+        candidate_context_events = append_candidate_context_event(
+            candidate_context_events,
+            **store_event,
+        )
+        return {
+            "answer": _format_product_id_clarification(candidates),
+            "status": "completed",
+            "tool_calls": [],
+            "debug": build_candidate_context_debug(candidate_context_events),
+        }
+
+    try:
+        ACTION_REGISTRY.validate_request(
+            ActionRequest(
+                action_type="add_to_cart",
+                user_id=user_id,
+                thread_id=thread_id,
+                arguments={"product_id": product_id, "quantity": quantity},
+            )
+        )
+    except ActionRegistryError:
+        result = {
+            "answer": "当前无法创建该待确认动作，请稍后重试。",
+            "status": "failed",
+            "tool_calls": [],
+        }
+        if candidate_context_events:
+            result["debug"] = build_candidate_context_debug(candidate_context_events)
+        return result
+
+    gateway = tool_gateway or WRITE_HANDOFF_GATEWAY
+    tool_result, tool_record = gateway.invoke(
+        agent_name="write_handoff",
+        tool=prepare_add_to_cart,
+        arguments={
+            "user_id": user_id,
+            "product_id": product_id,
+            "quantity": quantity,
+            "thread_id": thread_id,
+        },
+        context=runtime_context,
+    )
+    outcome = parse_cart_action_outcome(tool_result)
+    if outcome is None:
+        result = {
+            "answer": "当前无法解析加购动作结果，请稍后重试。",
+            "status": "failed",
+            "tool_calls": [WRITE_HANDOFF_TOOL_CALL],
+            "tool_call_records": [tool_record.model_dump(mode="json")],
+        }
+        if candidate_context_events:
+            result["debug"] = build_candidate_context_debug(candidate_context_events)
+        return result
+
+    pending_action_id = outcome.pending_action_id
+    if outcome.status == "clarification_required":
+        result = {
+            "answer": format_cart_action_outcome(outcome),
+            "status": "completed",
+            "tool_calls": [WRITE_HANDOFF_TOOL_CALL],
+            "tool_call_records": [tool_record.model_dump(mode="json")],
+            "debug": {"write_handoff_outcome": outcome.model_dump(mode="json")},
+        }
+        if candidate_context_events:
+            result["debug"] = {
+                **result["debug"],
+                **build_candidate_context_debug(candidate_context_events),
+            }
+        return result
+
+    if outcome.status != "prepared" or not pending_action_id:
+        result = {
+            "answer": format_cart_action_outcome(outcome),
+            "status": "failed",
+            "tool_calls": [WRITE_HANDOFF_TOOL_CALL],
+            "tool_call_records": [tool_record.model_dump(mode="json")],
+            "debug": {"write_handoff_outcome": outcome.model_dump(mode="json")},
+        }
+        if candidate_context_events:
+            result["debug"] = {
+                **result["debug"],
+                **build_candidate_context_debug(candidate_context_events),
+            }
+        return result
+
+    if runtime_context is not None:
+        runtime_context.emit_event(
+            "action.prepared",
+            visibility=EventVisibility.CLIENT,
+            agent_name="write_handoff",
+            payload={
+                "action_id": pending_action_id,
+                "action_type": "add_to_cart",
+                "status": "pending",
+                "risk_class": "high",
+            },
+        )
+
+    if resolved_from_candidate:
+        cleared = clear_candidate_context(user_id, thread_id)
+        candidate_context_events = append_candidate_context_event(
+            candidate_context_events,
+            event="candidate_context_cleared",
+            cleared=cleared,
+        )
+    result = {
+        "answer": format_cart_action_outcome(outcome),
+        "status": "confirmation_required",
+        "tool_calls": [WRITE_HANDOFF_TOOL_CALL],
+        "tool_call_records": [tool_record.model_dump(mode="json")],
+        "pending_action_id": pending_action_id,
+        "debug": {"write_handoff_outcome": outcome.model_dump(mode="json")},
+    }
+    if candidate_context_events:
+        result["debug"] = {
+            **result["debug"],
+            **build_candidate_context_debug(candidate_context_events),
+        }
+    return result

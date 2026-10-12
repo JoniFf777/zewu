@@ -1,0 +1,124 @@
+name: PostgreSQL Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_tools:
+        description: "Run smoke check with LangChain tool calls"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL + pgvector integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: retailpilot_v2_smoke
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d retailpilot_v2_smoke"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/retailpilot_v2_smoke?connect_timeout=5
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/retailpilot_v2_smoke_test?connect_timeout=5
+      EMBEDDING_PROVIDER: huggingface
+      VECTOR_DIMENSION: "768"
+      LANGSMITH_TRACING: "false"
+      WORKSHOP_MODEL: anthropic:claude-haiku-4-5
+      RUN_POSTGRES_INTEGRATION: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-all-mpnet-base-v2-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest httpx
+
+      - name: Apply database migrations
+        run: python -m alembic upgrade head
+
+      - name: Seed structured data
+        run: python scripts/seed_postgres.py --clear
+
+      - name: Index documents into pgvector
+        run: python scripts/index_documents_pgvector.py --clear
+
+      - name: Run V3 PostgreSQL handoff smoke suite
+        run: |
+          if [ "${{ inputs.include_tools }}" = "true" ]; then
+            python scripts/smoke_v3_handoff.py --json --include-tool-smoke
+          else
+            python scripts/smoke_v3_handoff.py --json
+          fi
+
+      - name: Run PostgreSQL integration tests
+        run: python -m pytest tests/integration
+
+      - name: Record V6 runtime cleanup success evidence
+        env:
+          SHOPMIND_RUNTIME_CLEANUP_EVIDENCE_PATH: artifacts/v6-deployment-readiness/runtime-cleanup-evidence.json
+        run: |
+          mkdir -p artifacts/v6-deployment-readiness
+          python scripts/cleanup_runtime_persistence.py
+
+      - name: Gate V6 deployment readiness
+        env:
+          SHOPMIND_DEPLOYMENT_PROFILE: production
+          SHOPMIND_DEPLOYMENT_REPLICAS: "1"
+          SHOPMIND_IDENTITY_PROVIDER: trusted_header
+          SHOPMIND_TRUSTED_PROXY_AUTHENTICATION: "true"
+          SHOPMIND_COORDINATION_BACKEND: local
+          SHOPMIND_GOVERNANCE_AUDIT_ENABLED: "true"
+          SHOPMIND_RUNTIME_CLEANUP_SCHEDULED: "true"
+          SHOPMIND_RUNTIME_CLEANUP_EVIDENCE_PATH: artifacts/v6-deployment-readiness/runtime-cleanup-evidence.json
+          SHOPMIND_RUNTIME_MAX_DURATION_MS: "30000"
+          SHOPMIND_RUNTIME_MAX_STEPS: "20"
+          SHOPMIND_RUNTIME_MAX_TOOL_CALLS: "10"
+          SHOPMIND_RUNTIME_MAX_TOTAL_TOKENS: "20000"
+          SHOPMIND_RUNTIME_MAX_COST_USD: "1.0"
+        run: |
+          python scripts/check_deployment_readiness.py --output-json artifacts/v6-deployment-readiness/summary.json | tee artifacts/v6-deployment-readiness/summary.md
+
+      - name: Publish V6 deployment readiness
+        if: always()
+        run: |
+          if [ -f artifacts/v6-deployment-readiness/summary.md ]; then
+            cat artifacts/v6-deployment-readiness/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload V6 deployment readiness
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: v6-deployment-readiness
+          path: artifacts/v6-deployment-readiness
+          if-no-files-found: error

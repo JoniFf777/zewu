@@ -1,0 +1,197 @@
+# 择物：基于 LangGraph 的智能购物决策与交易系统
+
+择物以 Agent Engineering 为主线，面向中文购物需求，使用 LangGraph 编排只读角色，并以结构化事实、证据和用户确认连接受控工具。购物车、订单与模拟支付用于验证 Agent 动作的安全边界，交易后台扩建不是当前发展重点。
+
+当前维护者：[JoniFf777](https://github.com/JoniFf777)。本展示仓库从 [原仓库](https://github.com/JoniFf777/retailpilot) 的远程 `main` 提交 `2198bd5ad73637c28d373697f91183b4377755da` 导入独立历史，保留原始 Apache-2.0 许可证及来源说明。单一导入提交不表示所有代码均为当前维护者原创，详见 [源码来源与版本范围](SOURCE_PROVENANCE.md)。
+
+本快照不包含原工作区尚未提交或尚未合入 `main` 的任务工作台、协作购物后续实现及新规划文件。下方文档保留该基线的实际能力与历史版本记录；既有 `shopmind` / `retailpilot` 技术标识继续兼容。
+
+The imported baseline turns a natural-language need into deterministic SKU candidates, requires explicit human confirmation before a write, and carries the selected SKU through Cart, Checkout Preview, Order reservation, Mock Payment, paid inventory consumption, and a transactional Outbox.
+
+The project demonstrates how agent UX and database transaction truth can coexist. Recommendations may use multiple read agents, but PostgreSQL remains the source of truth for Cart, Order, inventory, Payment, and Outbox facts.
+
+## Core workflow
+
+```mermaid
+flowchart LR
+    Need["Shopping need"] --> Agents["Multi-Agent recommendation"]
+    Agents --> SKU["Ranked SKU candidates"]
+    SKU --> HITL["PendingAction / HITL"]
+    HITL --> Cart
+    Cart --> Preview["Checkout Preview"]
+    Preview --> Order["Order + inventory reservation"]
+    Order --> Payment["Mock Payment"]
+    Payment --> Paid["Order paid / stock consumed"]
+    Paid --> Outbox["Transactional Outbox"]
+    Outbox -. optional .-> MQ["RocketMQ FIFO publisher"]
+```
+
+## Engineering highlights
+
+- SKU-level truth prevents a product-level recommendation from becoming an ambiguous write.
+- Deterministic Catalog filtering/ranking keeps the default demo reproducible.
+- PendingAction HITL separates read-only agent reasoning from confirmed writes.
+- Cart versions and conditional updates detect stale browser mutations.
+- Checkout snapshots and signed tokens bind Order creation to reviewed facts.
+- Owner-scoped idempotency keys make response-loss retries safe.
+- Row locks, stable SKU ordering, and conditional inventory updates prevent oversell under real PostgreSQL concurrency.
+- Payment claims commit before provider I/O; provider success is durable and recoverable before local finalization.
+- Order/Payment facts and Outbox events commit atomically. Publishing is at-least-once with stable event IDs, per-Order FIFO, leases, CAS completion, dead-lettering, and operator redrive.
+- Correlation IDs and structured operational logs are bounded and PII-safe.
+- Acceptance includes real PostgreSQL races and a real browser/backend/database live path, not only mocked tests.
+
+## Architecture
+
+The React/Vite application calls FastAPI. Agent orchestration and deterministic recommendation reads feed a guarded commerce backend. PostgreSQL owns business state; RocketMQ is an optional publisher target, never a Core Demo dependency.
+
+See [docs/architecture.md](docs/architecture.md) for system, transaction, and state diagrams, and [docs/interview_guide.md](docs/interview_guide.md) for a portfolio-oriented walkthrough.
+
+## Tech stack
+
+- Python, FastAPI, Pydantic, SQLAlchemy, Alembic
+- LangGraph/LangChain multi-agent runtime
+- PostgreSQL and pgvector
+- React, TypeScript, Vite, TanStack Query
+- Vitest and Playwright
+- Optional Apache RocketMQ Python publisher
+
+## Quick start
+
+Prerequisites: Python 3.11+ with project dependencies, Node.js/npm, Docker, and PostgreSQL from `docker-compose.yml`.
+
+Activate the Python environment first. If `python` is not on PATH, set `SHOPMIND_PYTHON` to the interpreter path. Copy `.env.example` to an untracked `.env` only when local overrides are needed; never commit credentials.
+
+```powershell
+docker compose up -d postgres
+npm --prefix frontend ci
+# Set DATABASE_URL to an isolated *_demo, *_test, or *_smoke database first.
+# Set POSTGRES_ADMIN_URL when that database does not yet have pgvector.
+python scripts/prepare_shopmind_demo.py --json
+python -m uvicorn app.main:app --reload
+```
+
+For an empty database, the prepare command ensures the `vector` extension
+through the operator-only connection, then runs Alembic and idempotent seeds
+through the application connection. The application role is never granted
+extension-install or superuser access. The explicit full bootstrap entry point
+is `python scripts/bootstrap_postgres.py --execute --confirm-clear --skip-documents`
+against a deliberately isolated target.
+
+In another terminal:
+
+```powershell
+npm --prefix frontend run dev -- --host 127.0.0.1
+```
+
+## Core Demo
+
+The deterministic Core Demo needs PostgreSQL, Backend, Frontend, and the seeded Catalog. It disables LangSmith and does not load or start RocketMQ.
+
+```powershell
+./scripts/start_shopmind_demo.ps1 -Prepare
+./scripts/start_shopmind_demo.ps1 -Start
+./scripts/start_shopmind_demo.ps1 -Verify
+```
+
+`-Start` is fail-closed when either port is occupied. Custom ports are supported with `-BackendPort` and `-FrontendPort`; `-ReuseExisting` is an explicit local convenience and is not allowed for clean-room acceptance.
+
+Run the real browser gate while the demo services are running:
+
+```powershell
+npm --prefix frontend run test:e2e:live
+```
+
+The live config connects only to `SHOPMIND_FRONTEND_URL` and `SHOPMIND_BACKEND_URL` (defaults `127.0.0.1:5173` and `127.0.0.1:8000`). Demo Start builds the frontend with `VITE_SHOPMIND_DEMO_IDENTITY=true`.
+
+## Tests and acceptance
+
+Retrieval-only evaluation is independent from answer generation. Given a JSON
+capture with `cases`, `retrieved_ids`, and `relevant_ids`, run:
+
+```powershell
+python evaluation/run_retrieval_eval.py retrieval-cases.json --json
+```
+
+The report contains Hit@K, Recall@K, and MRR without calling a model.
+
+For a no-database regression smoke over the new request/evidence contracts,
+run the explicitly synthetic suite:
+
+```powershell
+conda run -n pythonLearn D:\DL\Anaconda3\envs\pythonLearn\python.exe evaluation\run_simulated_eval.py --output-dir artifacts\simulated-eval --json
+```
+
+Its 20 request cases and 12 retrieval cases are synthetic and must not be
+presented as human quality or production latency measurements.
+
+The structured recommendation and retrieval contracts can also be exercised
+directly:
+
+```powershell
+conda run -n pythonLearn D:\DL\Anaconda3\envs\pythonLearn\python.exe evaluation\run_ablation_eval.py --output-json artifacts\synthetic-ablation\summary.json
+conda run -n pythonLearn D:\DL\Anaconda3\envs\pythonLearn\python.exe evaluation\run_retrieval_capture.py retrieval-capture.json --output-json artifacts\retrieval-capture\summary.json --code-version workspace
+```
+
+The capture input contains server-selected `top_k` candidates; only evidence
+IDs and sanitized diagnostics are written to the artifact.
+
+```powershell
+python -m pytest tests -p no:cacheprovider
+$env:RUN_POSTGRES_INTEGRATION = "1"
+python -m pytest tests/integration -p no:cacheprovider
+npm --prefix frontend run test
+npm --prefix frontend run e2e
+npm --prefix frontend run lint
+npm --prefix frontend run typecheck
+npm --prefix frontend run typecheck:e2e
+npm --prefix frontend run build
+npm --prefix frontend run check:budget
+```
+
+The release gate additionally runs Catalog migration round-trip, Phase 3-6 PostgreSQL suites, compileall, Core Demo Verify, live Playwright, and a clean-room snapshot built without `.git`, `.env`, `node_modules`, `dist`, caches, or local artifacts.
+
+## Optional RocketMQ reliability demo
+
+The Core Demo already commits Outbox rows with business facts. To demonstrate asynchronous delivery, build/install the pinned worker SDK separately, start a disposable broker, configure the Outbox variables from `.env.example`, and run:
+
+```powershell
+./scripts/bootstrap_rocketmq_sdk.ps1
+python scripts/run_outbox_publisher.py
+python scripts/inspect_outbox.py --json
+```
+
+This is an at-least-once publisher demo. A RocketMQ consumer and Inbox are not implemented.
+
+## Project structure
+
+```text
+agents/       multi-agent recommendation and guarded handoff
+app/          FastAPI, services, repositories, commerce and Outbox
+alembic/      PostgreSQL migrations through 0015
+frontend/     React/TypeScript application and browser tests
+tests/        unit, API, migration and real PostgreSQL acceptance
+scripts/      setup, demo, smoke and Outbox operator commands
+docs/         architecture, contracts, status and design records
+data/catalog/ deterministic ShopMind Catalog seed
+```
+
+## Design decisions
+
+The project deliberately uses PostgreSQL locks for commerce invariants rather than introducing Redis into transaction truth. External provider and broker I/O happen outside business transactions. Idempotency handles client retries; the Outbox handles database-to-broker handoff. Neither mechanism claims exactly-once delivery.
+
+## Known limitations
+
+The project does not implement real payments or card collection, refunds, chargebacks, webhooks, automatic payment reconciliation, shipping/address/tax, fulfillment, a RocketMQ consumer, Inbox, consumer deduplication, or Redis-backed commerce state. Inbox/Consumer remains a future extension.
+
+## Documentation and release history
+
+- [Complete project introduction](docs/project_introduction.md)
+- [Current project status](docs/project_status.md)
+- [Frontend implementation plan](docs/frontend_implementation_plan.md)
+- [Public V3 API handoff contract](docs/v3_api_handoff_contract.md)
+- [V3 multi-agent handoff summary](docs/v3_multi_agent_handoff_summary.md)
+
+The published compatibility baseline remains **ShopMind V3.0.0**. The current
+Release Candidate adds the catalog-to-payment commerce flow, frontend, Outbox,
+demo packaging, and observability without silently changing that historical
+tag.

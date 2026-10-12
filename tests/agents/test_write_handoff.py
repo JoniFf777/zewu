@@ -1,0 +1,517 @@
+from contextlib import contextmanager
+from decimal import Decimal
+
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
+
+from agents.shopmind_multi_agent.write_handoff import (
+    clear_candidate_context,
+    extract_product_id,
+    find_product_candidates,
+    get_candidate_context,
+    infer_product_category,
+    extract_quantity,
+    invoke_write_handoff,
+)
+from app.db.base import Base
+from app.catalog.models import CatalogCategory, CatalogInventory, CatalogProduct, CatalogSku
+from app.db.models import PendingAction, Product, UserPreference
+from app.runtime import RunContext, RunRequest
+from app.runtime.actions import ActionRegistryError
+import tools.cart as cart_tools
+
+
+TEST_USER_ID = "WRITE_HANDOFF_USER"
+TEST_PRODUCT_ID = "TECH-KEY-001"
+
+
+def _seed_catalog_for_legacy_products(session, product_ids: list[str]) -> None:
+    category = CatalogCategory(code="keyboards", name="Keyboards", status="active")
+    session.add(category)
+    for index, product_id in enumerate(product_ids, 1):
+        product = CatalogProduct(
+            product_code=f"CAT-KEY-{index}",
+            legacy_product_id=product_id,
+            category=category,
+            brand="ShopMind",
+            name=f"Catalog {product_id}",
+            sale_status="active",
+            attributes_json={},
+        )
+        sku = CatalogSku(
+            product=product,
+            sku_code=f"{product_id}-SKU",
+            name="Standard",
+            money_amount=Decimal("99.00"),
+            currency="CNY",
+            sale_status="active",
+            variant_attributes_json={},
+        )
+        session.add_all([product, sku, CatalogInventory(sku=sku, on_hand_quantity=20, reserved_quantity=0, version=0)])
+
+
+def _candidate_context_events(result: dict) -> list[dict]:
+    return result["debug"]["candidate_context"]["events"]
+
+
+def test_extract_product_id_normalizes_explicit_id() -> None:
+    assert extract_product_id("帮我把 tech-key-001 加入购物车") == TEST_PRODUCT_ID
+
+
+def test_extract_quantity_defaults_to_one() -> None:
+    assert extract_quantity(f"帮我把 {TEST_PRODUCT_ID} 加入购物车") == 1
+
+
+def test_extract_quantity_supports_simple_number_patterns() -> None:
+    assert extract_quantity(f"帮我把 {TEST_PRODUCT_ID} 加入购物车 2 个") == 2
+    assert extract_quantity(f"add to cart {TEST_PRODUCT_ID} quantity 3") == 3
+    assert extract_quantity(f"add {TEST_PRODUCT_ID} x4") == 4
+    assert extract_quantity(f"帮我买两个 {TEST_PRODUCT_ID}") == 2
+
+
+def test_infer_product_category_from_common_terms() -> None:
+    assert infer_product_category("帮我把这个键盘加入购物车") == "Keyboards"
+    assert infer_product_category("add this monitor to cart") == "Monitors"
+    assert infer_product_category("这个不明确的东西加入购物车") is None
+
+
+def test_write_handoff_requires_user_id() -> None:
+    result = invoke_write_handoff(f"帮我把 {TEST_PRODUCT_ID} 加入购物车")
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == []
+    assert "user_id" in result["answer"]
+
+
+def test_write_handoff_requires_explicit_product_id_when_no_candidate() -> None:
+    result = invoke_write_handoff("帮我把这个东西加入购物车", user_id=TEST_USER_ID)
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == []
+    assert "商品 ID" in result["answer"]
+
+
+def test_write_handoff_rejects_action_when_registry_validation_fails(monkeypatch) -> None:
+    def reject_action(request):
+        raise ActionRegistryError("blocked")
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff.ACTION_REGISTRY.validate_request",
+        reject_action,
+    )
+
+    result = invoke_write_handoff(
+        f"add {TEST_PRODUCT_ID} to cart",
+        user_id=TEST_USER_ID,
+        thread_id="thread-1",
+    )
+
+    assert result["status"] == "failed"
+    assert result["tool_calls"] == []
+
+
+def test_write_handoff_suggests_candidates_without_creating_action(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add_all(
+        [
+            Product(
+                product_id=TEST_PRODUCT_ID,
+                name="Test Keyboard",
+                category="Keyboards",
+                price=99.00,
+                in_stock=True,
+            ),
+            Product(
+                product_id="TECH-KEY-002",
+                name="Budget Keyboard",
+                category="Keyboards",
+                price=49.00,
+                in_stock=True,
+            ),
+        ]
+    )
+    _seed_catalog_for_legacy_products(session, [TEST_PRODUCT_ID, "TECH-KEY-002"])
+    session.commit()
+
+    @contextmanager
+    def fake_product_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_product_session,
+    )
+
+    result = invoke_write_handoff("帮我把这个键盘加入购物车", user_id=TEST_USER_ID)
+    pending_count = session.scalar(
+        select(func.count()).select_from(PendingAction)
+    )
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == []
+    assert "请选择" in result["answer"] or "可从这些候选中选择" in result["answer"]
+    assert TEST_PRODUCT_ID in result["answer"]
+    assert "TECH-KEY-002" in result["answer"]
+    assert pending_count == 0
+
+    session.close()
+
+
+def test_write_handoff_resolves_same_thread_candidate_selection(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add_all(
+        [
+            Product(
+                product_id=TEST_PRODUCT_ID,
+                name="Test Keyboard",
+                category="Keyboards",
+                price=49.00,
+                in_stock=True,
+            ),
+            Product(
+                product_id="TECH-KEY-002",
+                name="Premium Keyboard",
+                category="Keyboards",
+                price=99.00,
+                in_stock=True,
+            ),
+        ]
+    )
+    _seed_catalog_for_legacy_products(session, [TEST_PRODUCT_ID, "TECH-KEY-002"])
+    session.commit()
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_session,
+    )
+    monkeypatch.setattr(cart_tools, "_get_cart_session", fake_session)
+
+    thread_id = "thread-candidate-selection"
+    first_result = invoke_write_handoff(
+        "帮我把这个键盘加入购物车 2 个",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    second_result = invoke_write_handoff(
+        "选 1",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    pending_action = session.get(PendingAction, second_result["pending_action_id"])
+
+    assert first_result["status"] == "completed"
+    assert first_result["tool_calls"] == []
+    assert TEST_PRODUCT_ID in first_result["answer"]
+    assert second_result["status"] == "confirmation_required"
+    assert second_result["tool_calls"] == ["prepare_add_to_cart"]
+    assert pending_action is not None
+    assert pending_action.thread_id == thread_id
+    assert pending_action.payload_json["schema_version"] == "shopmind.pending_action.add_to_cart.v1"
+    assert pending_action.payload_json["origin"] == "legacy_chat"
+    assert pending_action.payload_json["origin_identifier"] == TEST_PRODUCT_ID
+
+    clear_candidate_context(TEST_USER_ID, thread_id)
+    session.close()
+
+
+def test_write_handoff_reports_candidate_selection_out_of_range(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add_all(
+        [
+            Product(
+                product_id=TEST_PRODUCT_ID,
+                name="Test Keyboard",
+                category="Keyboards",
+                price=49.00,
+                in_stock=True,
+            ),
+            Product(
+                product_id="TECH-KEY-002",
+                name="Premium Keyboard",
+                category="Keyboards",
+                price=99.00,
+                in_stock=True,
+            ),
+        ]
+    )
+    session.commit()
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_session,
+    )
+    monkeypatch.setattr(cart_tools, "_get_cart_session", fake_session)
+
+    thread_id = "thread-candidate-out-of-range"
+    invoke_write_handoff(
+        "帮我把这个键盘加入购物车",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    result = invoke_write_handoff(
+        "选 3",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    pending_count = session.scalar(select(func.count()).select_from(PendingAction))
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == []
+    assert "当前候选只有 1-2" in result["answer"]
+    assert "你选择的是 3" in result["answer"]
+    assert pending_count == 0
+    assert get_candidate_context(TEST_USER_ID, thread_id) is not None
+
+    clear_candidate_context(TEST_USER_ID, thread_id)
+    session.close()
+
+
+def test_write_handoff_does_not_resolve_selection_without_context(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_session,
+    )
+
+    result = invoke_write_handoff(
+        "选 1",
+        user_id=TEST_USER_ID,
+        thread_id="thread-without-candidates",
+    )
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == []
+    assert "商品 ID" in result["answer"]
+
+    session.close()
+
+
+def test_find_product_candidates_uses_catalog_category(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add(
+        Product(
+            product_id=TEST_PRODUCT_ID,
+            name="Test Keyboard",
+            category="Keyboards",
+            price=99.00,
+            in_stock=True,
+        )
+    )
+    _seed_catalog_for_legacy_products(session, [TEST_PRODUCT_ID])
+    session.commit()
+
+    @contextmanager
+    def fake_product_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_product_session,
+    )
+
+    candidates = find_product_candidates("帮我把这个键盘加入购物车")
+
+    assert [candidate["product_id"] for candidate in candidates] == [TEST_PRODUCT_ID]
+
+    session.close()
+
+
+def test_write_handoff_prepares_add_to_cart(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add(
+        Product(
+            product_id=TEST_PRODUCT_ID,
+            name="Test Keyboard",
+            category="Keyboards",
+            price=99.00,
+            in_stock=True,
+        )
+    )
+    _seed_catalog_for_legacy_products(session, [TEST_PRODUCT_ID])
+    session.commit()
+
+    @contextmanager
+    def fake_cart_session():
+        yield session
+
+    monkeypatch.setattr(cart_tools, "_get_cart_session", fake_cart_session)
+
+    result = invoke_write_handoff(
+        f"帮我把 {TEST_PRODUCT_ID} 加入购物车 2 个",
+        user_id=TEST_USER_ID,
+        thread_id="thread-write-native",
+    )
+    pending_action = session.get(PendingAction, result["pending_action_id"])
+    pending_count = session.scalar(
+        select(func.count())
+        .select_from(PendingAction)
+        .where(PendingAction.user_id == TEST_USER_ID)
+    )
+
+    assert result["status"] == "confirmation_required"
+    assert result["tool_calls"] == ["prepare_add_to_cart"]
+    assert result["pending_action_id"]
+    assert pending_count == 1
+    assert pending_action is not None
+    assert pending_action.thread_id == "thread-write-native"
+    assert pending_action.status == "pending"
+    assert pending_action.payload_json["schema_version"] == "shopmind.pending_action.add_to_cart.v1"
+    assert pending_action.payload_json["origin"] == "legacy_chat"
+
+    session.close()
+
+
+def test_write_handoff_prepares_preference_without_writing_it(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    monkeypatch.setattr(cart_tools, "_get_cart_session", fake_session)
+
+    events = []
+    context = RunContext(
+        request=RunRequest(
+            operation="chat",
+            user_id=TEST_USER_ID,
+            thread_id="thread-preference",
+            input_text="记住我喜欢安静键盘",
+        )
+    )
+    context.bind_event_emitter(
+        lambda event_type, **kwargs: events.append((event_type, kwargs))
+    )
+
+    result = invoke_write_handoff(
+        "记住我喜欢安静键盘",
+        user_id=TEST_USER_ID,
+        thread_id="thread-preference",
+        runtime_context=context,
+    )
+    action = session.get(PendingAction, result["pending_action_id"])
+
+    assert result["status"] == "confirmation_required"
+    assert result["tool_calls"] == ["prepare_save_preference"]
+    assert action.action_type == "save_preference"
+    assert action.risk_class == "medium"
+    assert action.payload_json == {
+        "schema_version": "shopmind.pending_action.save_preference.v1",
+        "operation": "add",
+        "preference_type": "style",
+        "preference_value": "记住我喜欢安静键盘",
+    }
+    assert session.query(UserPreference).count() == 0
+    assert events[0][0] == "action.prepared"
+    assert events[0][1]["payload"]["action_type"] == "save_preference"
+    session.close()
+
+
+def test_write_handoff_reports_candidate_context_debug_events(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add_all(
+        [
+            Product(
+                product_id=TEST_PRODUCT_ID,
+                name="Test Keyboard",
+                category="Keyboards",
+                price=49.00,
+                in_stock=True,
+            ),
+            Product(
+                product_id="TECH-KEY-002",
+                name="Premium Keyboard",
+                category="Keyboards",
+                price=99.00,
+                in_stock=True,
+            ),
+        ]
+    )
+    _seed_catalog_for_legacy_products(session, [TEST_PRODUCT_ID, "TECH-KEY-002"])
+    session.commit()
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    monkeypatch.setattr(
+        "agents.shopmind_multi_agent.write_handoff._get_product_session",
+        fake_session,
+    )
+    monkeypatch.setattr(cart_tools, "_get_cart_session", fake_session)
+
+    thread_id = "thread-candidate-debug-events"
+    candidate_result = invoke_write_handoff(
+        "add this keyboard to cart quantity 2",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    selection_result = invoke_write_handoff(
+        "1",
+        user_id=TEST_USER_ID,
+        thread_id=thread_id,
+    )
+    miss_result = invoke_write_handoff(
+        "1",
+        user_id=TEST_USER_ID,
+        thread_id="thread-candidate-debug-miss",
+    )
+
+    assert _candidate_context_events(candidate_result)[-1] == {
+        "index": 1,
+        "event": "candidate_context_stored",
+        "candidate_count": 2,
+        "quantity": 2,
+        "ttl_seconds": 600,
+        "max_contexts": 100,
+    }
+    assert [event["event"] for event in _candidate_context_events(selection_result)] == [
+        "candidate_context_selected",
+        "candidate_context_cleared",
+    ]
+    assert _candidate_context_events(selection_result)[0]["quantity"] == 2
+    assert _candidate_context_events(selection_result)[1]["cleared"] is True
+    assert _candidate_context_events(miss_result)[0] == {
+        "index": 1,
+        "event": "candidate_context_missed",
+        "selection": 1,
+    }
+
+    session.close()
