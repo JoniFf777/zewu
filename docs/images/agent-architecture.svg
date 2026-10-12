@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1456" viewBox="0 0 1200 1456" role="img" aria-labelledby="title description">
+  <title id="title">择物的 Agent 协作架构</title>
+  <desc id="description">用户需求经 LangGraph 协调，按需调用商品、资料和偏好读取角色，再由汇总角色组织方案。写操作经过用户确认及执行前重验，运行底座贯穿权限、预算、事件和恢复。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8C9AB0"/></marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+      .title { font-size: 44px; font-weight: 700; fill: #162B43; }
+      .heading { font-size: 29px; font-weight: 700; fill: #162B43; }
+      .body { font-size: 24px; fill: #52657B; }
+      .small { font-size: 21px; fill: #65758B; }
+      .number { font-size: 21px; font-weight: 700; fill: #087F68; }
+      .connector { fill: none; stroke: #8C9AB0; stroke-width: 2.5; marker-end: url(#arrow); }
+      .branch { fill: none; stroke: #8C9AB0; stroke-width: 2.5; }
+    </style>
+  </defs>
+  <rect width="1200" height="1456" fill="#F5F8FC"/>
+  <rect x="24" y="24" width="1152" height="1408" rx="28" fill="#FFFFFF" stroke="#DFE7EF"/>
+  <rect x="64" y="68" width="8" height="46" rx="4" fill="#087F68"/>
+  <text x="94" y="104" class="title">择物的 Agent 协作架构</text>
+  <text x="94" y="145" class="body">理解需求 · 读取事实 · 组织决策 · 确认执行</text>
+
+  <rect x="64" y="182" width="1072" height="104" rx="18" fill="#F3F8FC" stroke="#DDE7F0"/>
+  <text x="88" y="220" class="number">01</text>
+  <text x="140" y="223" class="heading">用户需求</text>
+  <text x="140" y="262" class="body">预算、使用场景、商品比较、政策问题与已确认偏好</text>
+  <path d="M600 286 V320" class="connector"/>
+
+  <rect x="64" y="326" width="1072" height="112" rx="18" fill="#EEF2FC" stroke="#CDD8F5"/>
+  <text x="88" y="368" class="number">02</text>
+  <text x="140" y="369" class="heading">LangGraph 协调与路由</text>
+  <text x="140" y="408" class="body">识别查询意图，选择读取角色，并保持只读权限边界</text>
+  <path d="M600 438 V468 H234 V496" class="connector"/>
+  <path d="M600 468 V496" class="connector"/>
+  <path d="M600 468 H966 V496" class="connector"/>
+
+  <rect x="64" y="504" width="340" height="184" rx="18" fill="#EAF7F2" stroke="#BCDFD2"/>
+  <rect x="430" y="504" width="340" height="184" rx="18" fill="#EDF5FF" stroke="#C9DDF7"/>
+  <rect x="796" y="504" width="340" height="184" rx="18" fill="#F4F0FC" stroke="#DCD0F1"/>
+  <text x="88" y="545" class="number">03 · 商品角色</text>
+  <text x="88" y="584" class="heading">查询商品事实</text>
+  <text x="88" y="625" class="body">具体规格、价格与库存</text>
+  <text x="88" y="660" class="small">数据库商品目录是事实来源</text>
+  <text x="454" y="545" class="number">03 · 资料角色</text>
+  <text x="454" y="584" class="heading">检索相关依据</text>
+  <text x="454" y="625" class="body">产品说明、兼容与政策</text>
+  <text x="454" y="660" class="small">保留引用，检查适用范围</text>
+  <text x="820" y="545" class="number">03 · 偏好角色</text>
+  <text x="820" y="584" class="heading">读取个人偏好</text>
+  <text x="820" y="625" class="body">使用当前用户确认的信息</text>
+  <text x="820" y="660" class="small">保持用户隔离与只读权限</text>
+  <path d="M234 688 V721 H600" class="branch"/>
+  <path d="M966 688 V721 H600" class="branch"/>
+  <path d="M600 688 V748" class="connector"/>
+
+  <rect x="64" y="756" width="1072" height="112" rx="18" fill="#EEF8F5" stroke="#B9DBD0"/>
+  <text x="88" y="798" class="number">04</text>
+  <text x="140" y="799" class="heading">汇总角色与结构化校验</text>
+  <text x="140" y="838" class="body">整理候选、预算和约束，检查证据冲突，形成可解释结果</text>
+  <path d="M600 868 V902" class="connector"/>
+
+  <rect x="64" y="910" width="1072" height="104" rx="18" fill="#F3F8FC" stroke="#DDE7F0"/>
+  <text x="88" y="948" class="number">05</text>
+  <text x="140" y="951" class="heading">方案、差异与依据</text>
+  <text x="140" y="990" class="body">明确商品、展示取舍与引用；信息不足时请求补充</text>
+  <path d="M600 1014 V1048" class="connector"/>
+
+  <rect x="64" y="1056" width="1072" height="104" rx="18" fill="#FFF7E8" stroke="#EBD5A5"/>
+  <text x="88" y="1094" class="number">06</text>
+  <text x="140" y="1097" class="heading">用户选择与明确确认</text>
+  <text x="140" y="1136" class="body">预览待执行操作，确认前重新检查归属、有效期与业务事实</text>
+  <path d="M600 1160 V1194" class="connector"/>
+
+  <rect x="64" y="1202" width="1072" height="92" rx="18" fill="#F3F5F8" stroke="#DDE3EA"/>
+  <text x="88" y="1239" class="number">07</text>
+  <text x="140" y="1242" class="heading">受控动作验证层</text>
+  <text x="140" y="1276" class="body">购物车 → 结算与订单 → 模拟支付；幂等和事务保障执行结果</text>
+
+  <line x1="64" y1="1326" x2="1136" y2="1326" stroke="#E0E7EF"/>
+  <text x="64" y="1364" class="heading" style="font-size:24px">贯穿全链路的运行底座</text>
+  <text x="64" y="1400" class="small">身份与权限 · 有界上下文 · 预算与超时 · 顺序事件 · 持久化与恢复</text>
+  <text x="1136" y="1364" text-anchor="end" class="small">角色按需执行 · 关键路径可确定性运行</text>
+</svg>
