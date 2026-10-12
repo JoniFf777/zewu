@@ -134,9 +134,7 @@ data/catalog/   可复现的演示商品数据
 - [公共接口兼容合同](docs/v3_api_handoff_contract.md)
 - [历史多 Agent 版本交接记录](docs/v3_multi_agent_handoff_summary.md)
 
-## 版本、边界与来源
-
-本展示仓库从原仓库远程 `main` 的固定提交 `2198bd5` 导入，任务工作台、协作购物及后续规划尚未迁入。历史兼容发布记录仍为 **ShopMind V3.0.0**，旧 `shopmind` / `retailpilot` 标识用于保持配置、脚本和协议兼容。
+## 项目边界与来源
 
 支付使用模拟服务，未接入真实银行卡、退款、履约或自动对账。Agent 默认在同一后端进程内协作。RocketMQ 是可选事务事件发布路径，消费端和消费去重尚未实现。
 
